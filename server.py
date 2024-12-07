@@ -1,5 +1,10 @@
 # import grpc
 
+class LogEntry:
+    def __init__(self, operation, term):
+        self.operation = operation
+        self.term = term
+
 class Server:
     def __init__(self, node_id, membership_ids, port):
         self.node_id = node_id # Unique ID for self
@@ -30,6 +35,7 @@ class Server:
         #         self.raft_peers[i] = channel
         pass
 
+    # Invoked by: Follower (who suspects Leader fail), Candidate
     def start_election(self):
         self.current_term += 1
         self.current_role = 'Candidate'
@@ -52,9 +58,9 @@ class Server:
         
         if candidate_term == self.term and candidate_log_better and self.voted_for in [candidate_id, None]:
             self.voted_for = candidate_id
-            # TODO: Send VoteResponseRPC(true)
+            # TODO: Send VoteResponseRPC(true) to candidate_id
         else:
-            # TODO: Send VoteResponseRPC(false)
+            # TODO: Send VoteResponseRPC(false) to candidate_id
             pass
         
     # Invoked by: Candidate
@@ -70,7 +76,7 @@ class Server:
                         continue
                     self.sent_length[follower_id] = len(self.log)
                     self.acked_length[follower_id] = 0
-                    # TODO: ReplicateLog(node_id, follower_id)
+                    # TODO: self.replicate_log(self.node_id, follower_id)
         elif term > self.current_term:
             self.current_term = term
             self.current_role = 'Follower'
@@ -93,5 +99,91 @@ class Server:
                 pass
             self.commit_length = leader_commit
     
-    def on_log_request(leader_id, term, prefix_length, prefix_term, leader_commit, entries):
-        pass
+    def get_acks_for_length(self, length):
+        acks = 0
+        for node_id in self.membership_ids:
+            if self.acked_length[node_id] >= length:
+                acks += 1
+        return acks
+    
+    # Invoked by: Leader  
+    def commit_log_entries(self):
+        minimum_acks = len(self.membership_ids) // 2 + 1
+        highest_length = -1
+        for length in range(self.commit_length, len(self.log) + 1):
+            if self.get_acks_for_length(length) >= minimum_acks and length > highest_length:
+                highest_length = length
+        if highest_length != -1 and highest_length > self.commit_length and self.log[highest_length - 1].term == self.current_term:
+            for i in range(self.commit_length, highest_length - 1):
+                # TODO: Deliver log[i].msg to the application
+                pass
+            self.commit_length = highest_length
+    
+    # Invoked by: Leader
+    # LogRequest w/ empty suffix serves as heartbeat to let Followers know Leader still alive
+    def replicate_log(self, leader_id, follower_id):
+        prefix_length = self.sent_length[follower_id]
+        suffix = self.log[prefix_length:]
+        prefix_term = self.log[prefix_length - 1].term if prefix_length > 0 else 0
+        # TODO: send LogRequest(leader_id, current_term, prefix_length, prefix_term, commit_length, suffix)
+    
+    # Invoked by: Follower
+    # Equivalent to AppendEntries RPC in paper, is a wrapper that also checks for term
+    def on_log_request(self, leader_id, term, prefix_length, prefix_term, leader_commit, entries):
+        if term > self.current_term:
+            self.current_term = term
+            self.voted_for = None
+            # TODO: Cancel election timer
+        elif term == self.current_term:
+            self.current_role = 'Follower' 
+            self.current_leader = leader_id
+            log_ok = (len(self.log) >= prefix_length) and \
+                (prefix_length == 0 or self.log[-1].term == prefix_term)
+            if log_ok:
+                self.append_entries(prefix_length, leader_commit, entries)
+                new_acked_length = prefix_length + len(entries)
+                # TODO: LogResponse(self.node_id, self.current_term, new_acked_length, True) to leader_id
+            else:
+                # TODO: LogResponse(self.node_id, self.current_term, 0, False) to leader_id
+                pass
+            
+    # Invoked by: Leader
+    def on_log_response(self, follower_id, term, new_acked_length, success):
+        if term == self.current_term and self.current_role == 'Leader':
+            if success and new_acked_length >= self.acked_length[follower_id]:
+                self.sent_length[follower_id] = new_acked_length
+                self.acked_length[follower_id] = new_acked_length
+                # TODO: self.commit_log_entries()
+            elif self.sent_length[follower_id] > 0:
+                self.sent_length[follower_id] -= 1
+                # TODO: self.replicate_log(self.node_id, follower_id)
+            elif term > self.current_term:
+                self.current_term = term
+                self.current_role = 'Follower'
+                self.voted_for = None
+                # TODO: Cancel election timer
+                
+    # Invoked by: All            
+    def crash_recovery(self):
+        self.current_role = 'Follower'
+        self.current_leader = None
+        self.votes_received = set()
+        self.sent_length = {}
+        self.acked_length = {}
+        
+    # Invoked by: Leader
+    def on_put_request(self, key, value):
+        if self.current_role == 'Leader':
+            self.log.append(LogEntry((key, value), self.current_term))
+            self.acked_length[self.node_id] = len(self.log)
+            # TODO: self.replicate_log(self.node_id, follower_id) for every follower
+        else:
+            # TODO: Forward request to self.current_leader
+            pass
+    
+    # Invoked by: Leader
+    def leader_heartbeat(self):
+        if self.current_role == 'Leader':
+            # TODO: self.replicate_log(self.node_id, follower_id) for every follower
+            pass      
+            
