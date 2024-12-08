@@ -1,8 +1,24 @@
 syntax = "proto3";
 
-// heartbeat
-message Empty {
+option go_package = "../raftkv";
+package raftkv;
 
+message State {
+    int32 term = 1;
+    bool isLeader = 2; 
+}
+
+message KeyValue {
+    string key = 1;
+    string value = 2;
+    int64 ClientId = 3;
+    int64 RequestId = 4;
+}
+
+message GetKey {
+    string key = 1;
+    int64 ClientId = 2;
+    int64 RequestId = 3;
 }
 
 message Reply {
@@ -11,9 +27,12 @@ message Reply {
     string value = 3;
 }
 
-message State {
-    int32 term = 1;
-    bool isLeader = 2; 
+message Empty {
+
+}
+
+message IntegerArg {
+    int32 arg = 1;
 }
 
 message LogEntry {
@@ -32,10 +51,9 @@ message AppendEntriesRequest {
 } 
 
 message AppendEntriesReply {
-    int32 followerId = 1;
-    int32 term = 2;
-    int32 newAckedLength = 3;
-    int32 success = 4;
+    int32 term = 1;
+    int32 newAckedLength = 2;
+    int32 success = 3;
 }
 
 message VoteRequest {
@@ -50,25 +68,20 @@ message VoteReply {
     bool voteGranted = 2;
 }
 
-message GetKey {
-    string key = 1;
-    int64 ClientId = 2;
-    int64 RequestId = 3;
-}
- 
-message KeyValue {
-    string key = 1;
-    string value = 2;
-    int64 ClientId = 3;
-    int64 RequestId = 4;
-}
-
 service KeyValueStore {
     rpc GetState(Empty) returns (State) {};
     rpc Get(GetKey) returns (Reply) {};
     rpc Put(KeyValue) returns (Reply){};
     rpc Replace(KeyValue) returns (Reply){};
+}
 
-    rpc AppendEntries (AppendEntriesRequest) returns (AppendEntriesReply);
-    rpc RequestVote (VoteRequest) returns (VoteReply);
+service Raft {
+    rpc RequestVote(VoteRequest) returns (VoteReply) {};
+    rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesReply) {};
+}
+service FrontEnd {
+    rpc Get(GetKey) returns (Reply) {};
+    rpc Put(KeyValue) returns (Reply){};
+    rpc Replace(KeyValue) returns (Reply){};
+    rpc StartRaft(IntegerArg) returns (Reply){};
 }

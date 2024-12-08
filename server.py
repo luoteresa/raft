@@ -1,7 +1,8 @@
 import grpc
-import keyvaluestore_pb2 as kv_pb2
-import keyvaluestore_pb2_grpc as kv_pb2_grpc
-from concurrent import futures
+import server_pb2 as pb2
+import server_pb2_grpc as pb2_grpc
+import random
+import time
 
 class LogEntry:
     def __init__(self, key, value, term):
@@ -9,7 +10,7 @@ class LogEntry:
         self.value = value
         self.term = term
 
-class ServerHandler(kv_pb2.KeyValueStoreServicer):
+class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
     def __init__(self, node_id, membership_ids, port):
         self.node_id = node_id # Unique ID for self
         self.membership_ids = membership_ids # List of node IDs
@@ -24,11 +25,14 @@ class ServerHandler(kv_pb2.KeyValueStoreServicer):
         self.sent_length = {} # Maps follower IDs to length of logs sent
         self.acked_length = {} # Maps follower IDs to length of logs acked
         self.raft_peers = {} # Map membership IDs to gRPC connections
+        self.kv_store = {} # Key value store
         self.initialize_connections()
 
     def initialize_connections(self):
-        # TODO: Set up gRPC connections to membership servers
-        pass
+        for member_id in self.membership_ids:
+            channel = grpc.insecure_channel(f"localhost:{7000 + member_id}")
+            raft_stub = pb2.RaftStub(channel)
+            self.raft_peers[member_id] = raft_stub
 
     # Invoked by: Follower (who suspects Leader fail), Candidate
     def start_election(self):
@@ -38,7 +42,21 @@ class ServerHandler(kv_pb2.KeyValueStoreServicer):
         self.votes_received = {self.node_id}
         log_term = self.log[-1].term if len(self.log) else 0 
         
-        # TODO: Broadcast VoteRequest to members
+        # Broadcast VoteRequest to all members
+        for node_id in self.membership_ids:
+            if node_id != self.node_id:
+                request = pb2.VoteRequest(
+                    term=self.current_term,
+                    candidateId=self.node_id,
+                    lastLogIndex=len(self.log),
+                    lastLogTerm=log_term
+                )
+                try:
+                    # TODO: Thread so not blocked waiting for every node to respond
+                    response = self.raft_peers[node_id].RequestVote(request)
+                    self.on_vote_response(node_id, response.term, response.voteGranted)
+                except grpc.RpcError as e:
+                    print(f"Error contacting node {node_id}: {e}")
 
     # Invoked by: Follower, Candidate, Leader
     # RequestVote RPC
@@ -54,10 +72,8 @@ class ServerHandler(kv_pb2.KeyValueStoreServicer):
         
         if candidate_term == self.term and candidate_log_better and self.voted_for in [candidate_id, None]:
             self.voted_for = candidate_id
-            # TODO: Send VoteResponseRPC(true) to candidate_id
             return True
         else:
-            # TODO: Send VoteResponseRPC(false) to candidate_id
             return False
         
     # Invoked by: Candidate
@@ -73,7 +89,7 @@ class ServerHandler(kv_pb2.KeyValueStoreServicer):
                         continue
                     self.sent_length[follower_id] = len(self.log)
                     self.acked_length[follower_id] = 0
-                    # TODO: self.replicate_log(self.node_id, follower_id)
+                    self.replicate_log(self.node_id, follower_id)
         elif term > self.current_term:
             self.current_term = term
             self.current_role = 'Follower'
@@ -122,7 +138,21 @@ class ServerHandler(kv_pb2.KeyValueStoreServicer):
         prefix_length = self.sent_length[follower_id]
         suffix = self.log[prefix_length:]
         prefix_term = self.log[prefix_length - 1].term if prefix_length > 0 else 0
-        # TODO: send LogRequest(leader_id, current_term, prefix_length, prefix_term, commit_length, suffix)
+        request = pb2.AppendEntriesRequest(
+            leaderId=leader_id,
+            term=self.current_term,
+            prefixLength=prefix_length,
+            prefixTerm=prefix_term,
+            leaderCommit=self.commit_length,
+            entries=[pb2.LogEntry(term=entry.term, key=entry.key, value=entry.value) for entry in suffix]
+        )
+        
+        # TODO: Thread so not blocked waiting for node to respond
+        try:
+            response = self.raft_peers[follower_id].AppendEntries(request)
+            self.on_log_response(follower_id, response.term, response.newAckedLength, response.Success)
+        except grpc.RpcError as e:
+            print(f"Error replicating log to node {follower_id}: {e}")
     
     # Invoked by: Follower
     # Equivalent to AppendEntries RPC in paper, is a wrapper that also checks for term
@@ -139,10 +169,8 @@ class ServerHandler(kv_pb2.KeyValueStoreServicer):
             if log_ok:
                 self.append_entries(prefix_length, leader_commit, entries)
                 new_acked_length = prefix_length + len(entries)
-                # TODO: LogResponse(self.node_id, self.current_term, new_acked_length, True) to leader_id
                 return new_acked_length, True
             else:
-                # TODO: LogResponse(self.node_id, self.current_term, 0, False) to leader_id
                 return 0, False
             
     # Invoked by: Leader
@@ -151,10 +179,10 @@ class ServerHandler(kv_pb2.KeyValueStoreServicer):
             if success and new_acked_length >= self.acked_length[follower_id]:
                 self.sent_length[follower_id] = new_acked_length
                 self.acked_length[follower_id] = new_acked_length
-                # TODO: self.commit_log_entries()
+                self.commit_log_entries()
             elif self.sent_length[follower_id] > 0:
                 self.sent_length[follower_id] -= 1
-                # TODO: self.replicate_log(self.node_id, follower_id)
+                self.replicate_log(self.node_id, follower_id)
             elif term > self.current_term:
                 self.current_term = term
                 self.current_role = 'Follower'
@@ -168,48 +196,152 @@ class ServerHandler(kv_pb2.KeyValueStoreServicer):
         self.votes_received = set()
         self.sent_length = {}
         self.acked_length = {}
-        
-    # Invoked by: Leader
-    def on_put_request(self, key, value):
-        if self.current_role == 'Leader':
-            self.log.append(LogEntry(key, value, self.current_term))
-            self.acked_length[self.node_id] = len(self.log)
-            # TODO: self.replicate_log(self.node_id, follower_id) for every follower
-        else:
-            # TODO: Forward request to self.current_leader
-            pass
     
     # Invoked by: Leader
     def leader_heartbeat(self):
         if self.current_role == 'Leader':
-            # TODO: self.replicate_log(self.node_id, follower_id) for every follower
-            pass
+            for follower_id in self.membership_ids:
+                if follower_id != self.node_id:
+                    self.replicate_log(self.node_id, follower_id)
         
-    # GRPC IMPLEMENTATIONS
+    ### GRPC IMPLEMENTATIONS ###
     
     def GetState(self, request, context):
         reply = {"term": self.current_term, "isLeader": self.current_leader == self.node_id}
-        return kv_pb2.State(**reply)
+        return pb2.State(**reply)
 
     def Get(self, request, context):
-        pass
+        if self.current_role != 'Leader':
+            return pb2.Reply(
+                wrongLeader=True,
+                error=f"Node ID \{self.node_id} is not the leader.",
+                value=""
+            )
+        
+        if request.key in self.kv_store:
+            return pb2.Reply(
+                wrongLeader=False,
+                error="",
+                value=self.kv_store[request.key]
+            )
+        else:
+            return pb2.Reply(
+                wrongLeader=False,
+                error=f"Key \{request.key} not found.",
+                value=""
+            )
 
     def Put(self, request, context):
-        pass
-        # If Leader, append to log, return True
+        if self.current_role != 'Leader':
+            return pb2.Reply(
+                wrongLeader=True,
+                error=f"Node ID {self.node_id} is not the leader.",
+                value=""
+            )
+            
+         # Append to the Leader log
+        log_entry = LogEntry(request.key, request.value, self.current_term)
+        self.log.append(log_entry)
+        self.acked_length[self.node_id] = len(self.log)
+    
+        # Replicate log to followers
+        for follower_id in self.membership_ids:
+            if follower_id != self.node_id:
+                self.replicate_log(self.node_id, follower_id)
+        
+        # Wait for commitment
+        while len(self.log) > self.commit_length:
+            self.commit_log_entries()
+        
+        if request.key in self.kv_store and self.kv_store[request.key] == request.value:
+            return pb2.Reply(
+                wrongLeader=False,
+                error="",
+                value=request.value
+            )
+        else:
+            return pb2.Reply(
+                wrongLeader=False,
+                error="Failed to commit the log entry.",
+                value=""
+            )
 
     def Replace(self, request, context):
-        pass
+        if self.current_role != 'Leader':
+            return pb2.Reply(
+                wrongLeader=True,
+                error=f"Node ID {self.node_id} is not the leader.",
+                value=""
+            )
+            
+        # Validate the operation
+        if request.key not in self.kv_store:
+            return pb2.Reply(
+                wrongLeader=False,
+                error=f"Key {request.key} does not exist.",
+                value=""
+            )
+            
+        # Append to the Leader log
+        log_entry = LogEntry(request.key, request.value, self.current_term)
+        self.log.append(log_entry)
+        self.acked_length[self.node_id] = len(self.log)
+    
+        # Replicate log to followers
+        for follower_id in self.membership_ids:
+            if follower_id != self.node_id:
+                self.replicate_log(self.node_id, follower_id)
+        
+        # Wait for commitment
+        while len(self.log) > self.commit_length:
+            self.commit_log_entries()
+        
+        if request.key in self.kv_store and self.kv_store[request.key] == request.value:
+            return pb2.Reply(
+                wrongLeader=False,
+                error="",
+                value=request.value
+            )
+        else:
+            return pb2.Reply(
+                wrongLeader=False,
+                error="Failed to commit the log entry.",
+                value=""
+            )
 
     def AppendEntries(self, request, context):
         new_acked_length, success = self.on_log_request(request.leaderId, request.term, request.prefixLength, request.prefixTerm, request.leaderCommit, request.entries)
         reply = {"followerId": self.node_id, "term": self.current_term, "newAckedLength": new_acked_length, "success": success}
-        return kv_pb2.AppendEntriesReply(**reply)
+        return pb2.AppendEntriesReply(**reply)
 
     def RequestVote(self, request, context):
         vote_granted = self.on_vote_request(request.term, request.candidateId, request.lastLogIndex + 1, request.lastLogTerm)
         reply = {"term": self.current_term, "voteGranted": vote_granted}
-        return kv_pb2.VoteReply(**reply)
+        return pb2.VoteReply(**reply)
     
-    # TODO: run_candidate -- send out VoteRequest and process the vote responses using on_vote_response
+    ### RUNNERS ###
+    
+    def run_leader(self):
+        self.leader_heartbeat()
+    
+    def run_candidate(self):
+        self.start_election()
+        if len(self.votes_received) >= len(self.membership_ids) // 2 + 1:
+            self.current_role = 'Leader'
+            self.current_leader = self.node_id
+        else:
+            self.current_role = 'Follower'
+        time.sleep(random())
+    
+    def run_follower(self):
+        # TODO: Check for leader heartbeat, if None, self.current_role = 'Candidate'
+        pass
+    
+    def run(self):
+        if self.current_role == 'Leader':
+            self.run_leader()
+        elif self.current_role == 'Candidate':
+            self.run_candidate()
+        else:
+            self.run_follower()
             
