@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+service FrontEnd {
+    rpc Get(GetKey) returns (Reply) {};
+    rpc Put(KeyValue) returns (Reply){};
+    rpc Replace(KeyValue) returns (Reply){};
+    rpc StartRaft(IntegerArg) returns (Reply){};
+}
+
+message IntegerArg {
+    int32 arg = 1;
+}
+
+message GetKey {
+    string key = 1;
+    int64 ClientId = 2;
+    int64 RequestId = 3;
+}
+ 
+message KeyValue {
+    string key = 1;
+    string value = 2;
+    int64 ClientId = 3;
+    int64 RequestId = 4;
+}
+
+message Reply {
+    bool wrongLeader = 1;
+    string error = 2;
+    string value = 3;
+}

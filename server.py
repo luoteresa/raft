@@ -1,11 +1,15 @@
-# import grpc
+import grpc
+import keyvaluestore_pb2 as kv_pb2
+import keyvaluestore_pb2_grpc as kv_pb2_grpc
+from concurrent import futures
 
 class LogEntry:
-    def __init__(self, operation, term):
-        self.operation = operation
+    def __init__(self, key, value, term):
+        self.key = key
+        self.value = value
         self.term = term
 
-class Server:
+class ServerHandler(kv_pb2.KeyValueStoreServicer):
     def __init__(self, node_id, membership_ids, port):
         self.node_id = node_id # Unique ID for self
         self.membership_ids = membership_ids # List of node IDs
@@ -23,16 +27,7 @@ class Server:
         self.initialize_connections()
 
     def initialize_connections(self):
-        # Set up gRPC connections to membership servers
-        # number_of_servers = len(self.membership_ids) + 1
-        # start_idx = 7001 + self.node_id * number_of_servers
-        # for i in range(number_of_servers):
-        #     if i != self.node_id:
-        #         port_number = 9001 + i
-        #         src_port = start_idx + i
-        #         channel = grpc.insecure_channel(f"127.0.0.1:{port_number}", 
-        #                                         options=[('grpc.lb_policy_name', 'pick_first')])
-        #         self.raft_peers[i] = channel
+        # TODO: Set up gRPC connections to membership servers
         pass
 
     # Invoked by: Follower (who suspects Leader fail), Candidate
@@ -46,6 +41,7 @@ class Server:
         # TODO: Broadcast VoteRequest to members
 
     # Invoked by: Follower, Candidate, Leader
+    # RequestVote RPC
     def on_vote_request(self, candidate_id, candidate_term, candidate_log_length, candidate_log_term):
         if candidate_term > self.current_term:
                 self.current_term = candidate_term
@@ -59,9 +55,10 @@ class Server:
         if candidate_term == self.term and candidate_log_better and self.voted_for in [candidate_id, None]:
             self.voted_for = candidate_id
             # TODO: Send VoteResponseRPC(true) to candidate_id
+            return True
         else:
             # TODO: Send VoteResponseRPC(false) to candidate_id
-            pass
+            return False
         
     # Invoked by: Candidate
     def on_vote_response(self, voter_id, term, granted):
@@ -143,9 +140,10 @@ class Server:
                 self.append_entries(prefix_length, leader_commit, entries)
                 new_acked_length = prefix_length + len(entries)
                 # TODO: LogResponse(self.node_id, self.current_term, new_acked_length, True) to leader_id
+                return new_acked_length, True
             else:
                 # TODO: LogResponse(self.node_id, self.current_term, 0, False) to leader_id
-                pass
+                return 0, False
             
     # Invoked by: Leader
     def on_log_response(self, follower_id, term, new_acked_length, success):
@@ -174,7 +172,7 @@ class Server:
     # Invoked by: Leader
     def on_put_request(self, key, value):
         if self.current_role == 'Leader':
-            self.log.append(LogEntry((key, value), self.current_term))
+            self.log.append(LogEntry(key, value, self.current_term))
             self.acked_length[self.node_id] = len(self.log)
             # TODO: self.replicate_log(self.node_id, follower_id) for every follower
         else:
@@ -185,5 +183,33 @@ class Server:
     def leader_heartbeat(self):
         if self.current_role == 'Leader':
             # TODO: self.replicate_log(self.node_id, follower_id) for every follower
-            pass      
+            pass
+        
+    # GRPC IMPLEMENTATIONS
+    
+    def GetState(self, request, context):
+        reply = {"term": self.current_term, "isLeader": self.current_leader == self.node_id}
+        return kv_pb2.State(**reply)
+
+    def Get(self, request, context):
+        pass
+
+    def Put(self, request, context):
+        pass
+        # If Leader, append to log, return True
+
+    def Replace(self, request, context):
+        pass
+
+    def AppendEntries(self, request, context):
+        new_acked_length, success = self.on_log_request(request.leaderId, request.term, request.prefixLength, request.prefixTerm, request.leaderCommit, request.entries)
+        reply = {"followerId": self.node_id, "term": self.current_term, "newAckedLength": new_acked_length, "success": success}
+        return kv_pb2.AppendEntriesReply(**reply)
+
+    def RequestVote(self, request, context):
+        vote_granted = self.on_vote_request(request.term, request.candidateId, request.lastLogIndex + 1, request.lastLogTerm)
+        reply = {"term": self.current_term, "voteGranted": vote_granted}
+        return kv_pb2.VoteReply(**reply)
+    
+    # TODO: run_candidate -- send out VoteRequest and process the vote responses using on_vote_response
             
