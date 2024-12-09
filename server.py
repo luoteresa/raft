@@ -1,13 +1,14 @@
-import grpc
+import grpc # type: ignore
 import server_pb2 as pb2
 import server_pb2_grpc as pb2_grpc
 import random
+import threading
 import time
-from threading import Thread, Timer
+from concurrent.futures import ThreadPoolExecutor
 
-ELECTION_TIMEOUT_MIN = 1.0  # 1 second
-ELECTION_TIMEOUT_MAX = 1.5  # Slight randomization to avoid split votes
-HEARTBEAT_INTERVAL = 0.1 # 10 heartbeats per second
+ELECTION_TIMEOUT_MIN = 0.8 
+ELECTION_TIMEOUT_MAX = 1.2 
+HEARTBEAT_INTERVAL = 0.2 # 5 heartbeats per second
 
 class LogEntry:
     def __init__(self, key, value, term):
@@ -31,20 +32,23 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
         self.acked_length = {} # Maps follower IDs to length of logs acked
         self.raft_peers = {} # Map membership IDs to gRPC connections
         self.kv_store = {} # Key value store
+        self.election_timer = None
+        self.heartbeat_timer = None
         self.initialize_connections()
 
     def initialize_connections(self):
         for member_id in self.membership_ids:
-            channel = grpc.insecure_channel(f"localhost:{7000 + member_id}")
-            raft_stub = pb2.RaftStub(channel)
-            self.raft_peers[member_id] = raft_stub
+            if self.node_id != member_id:
+                channel = grpc.insecure_channel(f"localhost:{7000 + member_id}")
+                raft_stub = pb2_grpc.RaftStub(channel)
+                self.raft_peers[member_id] = raft_stub
     
-    def reset_election_timer(self):
-        if self.election_timer:
-            self.election_timer.cancel()
-        timeout = random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX)
-        self.election_timer = Timer(timeout, self.start_election)
-        self.election_timer.start()
+    def reset_timer(self, timer, timeout, function, *args):
+        if timer:
+            timer.cancel()
+        timer = threading.Timer(timeout, function, args)
+        timer.start()
+        return timer
 
     # Invoked by: Follower (who suspects Leader fail), Candidate
     def start_election(self):
@@ -52,30 +56,29 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
         self.current_role = 'Candidate'
         self.voted_for = self.node_id
         self.votes_received = {self.node_id}
-        log_term = self.log[-1].term if len(self.log) else 0 
-        
-        # Broadcast VoteRequest to all members
-        vote_threads = []
-        for node_id in self.membership_ids:
-            if node_id != self.node_id:
-                request = pb2.VoteRequest(
-                    term=self.current_term,
-                    candidateId=self.node_id,
-                    lastLogIndex=len(self.log),
-                    lastLogTerm=log_term
-                )
-                thread = Thread(target=self.send_vote_request, args=(request, node_id))
-                vote_threads.append(thread)
+        log_term = self.log[-1].term if self.log else 0
 
-        self.reset_election_timer()      
-    
-    def send_vote_request(self, request, node_id):
-        try:
-            # TODO: Thread so not blocked waiting for every node to respond
-            response = self.raft_peers[node_id].RequestVote(request)
-            self.on_vote_response(node_id, response.term, response.voteGranted)
-        except grpc.RpcError as e:
-            print(f"Error contacting node {node_id}: {e}")
+        def request_vote(node_id):
+            request = pb2.VoteRequest(
+                term=self.current_term,
+                candidateId=self.node_id,
+                lastLogIndex=len(self.log),
+                lastLogTerm=log_term
+            )
+            try:
+                response = self.raft_peers[node_id].RequestVote(request)
+                self.on_vote_response(node_id, response.term, response.voteGranted)
+            except grpc.RpcError as e:
+                print(f"Error contacting node {node_id}: {e}")
+
+        with ThreadPoolExecutor() as executor:
+            for node_id in self.membership_ids:
+                if node_id != self.node_id:
+                    executor.submit(request_vote, node_id)
+
+        self.election_timer = self.reset_timer(
+            self.election_timer, random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), self.start_election
+        ) 
 
     # Invoked by: Follower, Candidate, Leader
     # RequestVote RPC
@@ -102,19 +105,25 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
             if len(self.votes_received) >= len(self.membership_ids) // 2 + 1:
                 self.current_role = 'Leader'
                 self.current_leader = self.node_id
-                # TODO: Cancel election timer
-                for follower_id in self.membership_ids:
-                    if follower_id == self.node_id:
-                        continue
+                if self.election_timer:
+                    self.election_timer.cancel()
+
+                def replicate_to_follower(follower_id):
                     self.sent_length[follower_id] = len(self.log)
                     self.acked_length[follower_id] = 0
                     self.replicate_log(self.node_id, follower_id)
+
+                with ThreadPoolExecutor() as executor:
+                    for follower_id in self.membership_ids:
+                        if follower_id != self.node_id:
+                            executor.submit(replicate_to_follower, follower_id)
         elif term > self.current_term:
             self.current_term = term
             self.current_role = 'Follower'
             self.voted_for = None
-            # TODO: Cancel election timer
-            
+            if self.election_timer:
+                self.election_timer.cancel()
+
     # Invoked by: Follower
     def append_entries(self, prefix_length, leader_commit, entries):
         # Append entries to the log and replicate
@@ -127,8 +136,9 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
                 self.log.append(entries[i])
         if leader_commit > self.commit_length:
             for i in range(self.commit_length, leader_commit):
-                # TODO: Deliver log[i].msg to the application
-                pass
+                # TODO: Deliver log[i].msg to the application -- Done in RPC implementation?
+                log_entry = self.log[i]
+                self.kv_store[log_entry.key] = log_entry.value
             self.commit_length = leader_commit
     
     def get_acks_for_length(self, length):
@@ -147,8 +157,9 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
                 highest_length = length
         if highest_length != -1 and highest_length > self.commit_length and self.log[highest_length - 1].term == self.current_term:
             for i in range(self.commit_length, highest_length - 1):
-                # TODO: Deliver log[i].msg to the application
-                pass
+                # TODO: Deliver log[i].msg to the application -- Done in the RPC implementation
+                log_entry = self.log[i]
+                self.kv_store[log_entry.key] = log_entry.value
             self.commit_length = highest_length
     
     # Invoked by: Leader
@@ -165,13 +176,15 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
             leaderCommit=self.commit_length,
             entries=[pb2.LogEntry(term=entry.term, key=entry.key, value=entry.value) for entry in suffix]
         )
-        
-        # TODO: Thread so not blocked waiting for node to respond
-        try:
-            response = self.raft_peers[follower_id].AppendEntries(request)
-            self.on_log_response(follower_id, response.term, response.newAckedLength, response.Success)
-        except grpc.RpcError as e:
-            print(f"Error replicating log to node {follower_id}: {e}")
+
+        def send_append_entries():
+            try:
+                response = self.raft_peers[follower_id].AppendEntries(request)
+                self.on_log_response(follower_id, response.term, response.newAckedLength, response.success)
+            except grpc.RpcError as e:
+                print(f"Error replicating log to node {follower_id}: {e}")
+
+        threading.Thread(target=send_append_entries).start()
     
     # Invoked by: Follower
     # Equivalent to AppendEntries RPC in paper, is a wrapper that also checks for term
@@ -179,7 +192,8 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
         if term > self.current_term:
             self.current_term = term
             self.voted_for = None
-            # TODO: Cancel election timer
+            if self.election_timer:
+                self.election_timer.cancel()
         elif term == self.current_term:
             self.current_role = 'Follower' 
             self.current_leader = leader_id
@@ -206,7 +220,8 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
                 self.current_term = term
                 self.current_role = 'Follower'
                 self.voted_for = None
-                # TODO: Cancel election timer
+                if self.election_timer:
+                    self.election_timer.cancel()
                 
     # Invoked by: All            
     def crash_recovery(self):
@@ -215,39 +230,34 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
         self.votes_received = set()
         self.sent_length = {}
         self.acked_length = {}
-
-    def reset_heartbeat_timer(self):
-        if self.heartbeat_timer:
-            self.heartbeat_timer.cancel()
-        self.heartbeat_timer = Timer(HEARTBEAT_INTERVAL, self.leader_heartbeat)
-        self.heartbeat_timer.start()
     
     # Invoked by: Leader
     def leader_heartbeat(self):
-        if self.current_role == 'Leader':
-            threads = []
+        def send_heartbeat(follower_id):
+            self.replicate_log(self.node_id, follower_id)
+
+        with ThreadPoolExecutor() as executor:
             for follower_id in self.membership_ids:
                 if follower_id != self.node_id:
-                    thread = Thread(self.replicate_log, kwargs={"leader_id": self.node_id, "follower_id": follower_id})
-                    thread.start()
-                    threads.append(thread)
-            
-            self.reset_heartbeat_timer()
+                    executor.submit(send_heartbeat, follower_id)
+
+        self.heartbeat_timer = self.reset_timer(
+            self.heartbeat_timer, HEARTBEAT_INTERVAL, self.leader_heartbeat
+        )
         
     ### GRPC IMPLEMENTATIONS ###
     
     def GetState(self, request, context):
-        reply = {"term": self.current_term, "isLeader": self.current_leader == self.node_id}
-        return pb2.State(**reply)
+        return pb2.State(term=self.current_term, isLeader=(self.current_leader == self.node_id))
 
     def Get(self, request, context):
         if self.current_role != 'Leader':
             return pb2.Reply(
                 wrongLeader=True,
-                error=f"Node ID \{self.node_id} is not the leader.",
+                error=f"Node ID {self.node_id} is not the leader.",
                 value=""
             )
-        
+
         if request.key in self.kv_store:
             return pb2.Reply(
                 wrongLeader=False,
@@ -257,7 +267,7 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
         else:
             return pb2.Reply(
                 wrongLeader=False,
-                error=f"Key \{request.key} not found.",
+                error=f"Key {request.key} not found.",
                 value=""
             )
 
@@ -268,21 +278,19 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
                 error=f"Node ID {self.node_id} is not the leader.",
                 value=""
             )
-            
-         # Append to the Leader log
+
         log_entry = LogEntry(request.key, request.value, self.current_term)
         self.log.append(log_entry)
         self.acked_length[self.node_id] = len(self.log)
-    
-        # Replicate log to followers
-        for follower_id in self.membership_ids:
-            if follower_id != self.node_id:
-                self.replicate_log(self.node_id, follower_id)
-        
-        # Wait for commitment
+
+        with ThreadPoolExecutor() as executor:
+            for follower_id in self.membership_ids:
+                if follower_id != self.node_id:
+                    executor.submit(self.replicate_log, self.node_id, follower_id)
+
         while len(self.log) > self.commit_length:
             self.commit_log_entries()
-        
+
         if request.key in self.kv_store and self.kv_store[request.key] == request.value:
             return pb2.Reply(
                 wrongLeader=False,
@@ -303,29 +311,26 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
                 error=f"Node ID {self.node_id} is not the leader.",
                 value=""
             )
-            
-        # Validate the operation
+
         if request.key not in self.kv_store:
             return pb2.Reply(
                 wrongLeader=False,
                 error=f"Key {request.key} does not exist.",
                 value=""
             )
-            
-        # Append to the Leader log
+
         log_entry = LogEntry(request.key, request.value, self.current_term)
         self.log.append(log_entry)
         self.acked_length[self.node_id] = len(self.log)
-    
-        # Replicate log to followers
-        for follower_id in self.membership_ids:
-            if follower_id != self.node_id:
-                self.replicate_log(self.node_id, follower_id)
-        
-        # Wait for commitment
+
+        with ThreadPoolExecutor() as executor:
+            for follower_id in self.membership_ids:
+                if follower_id != self.node_id:
+                    executor.submit(self.replicate_log, self.node_id, follower_id)
+
         while len(self.log) > self.commit_length:
             self.commit_log_entries()
-        
+
         if request.key in self.kv_store and self.kv_store[request.key] == request.value:
             return pb2.Reply(
                 wrongLeader=False,
@@ -340,38 +345,45 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
             )
 
     def AppendEntries(self, request, context):
-        new_acked_length, success = self.on_log_request(request.leaderId, request.term, request.prefixLength, request.prefixTerm, request.leaderCommit, request.entries)
-        reply = {"followerId": self.node_id, "term": self.current_term, "newAckedLength": new_acked_length, "success": success}
-        return pb2.AppendEntriesReply(**reply)
+        new_acked_length, success = self.on_log_request(
+            request.leaderId, request.term, request.prefixLength,
+            request.prefixTerm, request.leaderCommit, request.entries
+        )
+        return pb2.AppendEntriesReply(
+            followerId=self.node_id,
+            term=self.current_term,
+            newAckedLength=new_acked_length,
+            success=success
+        )
 
     def RequestVote(self, request, context):
-        vote_granted = self.on_vote_request(request.term, request.candidateId, request.lastLogIndex + 1, request.lastLogTerm)
-        reply = {"term": self.current_term, "voteGranted": vote_granted}
-        return pb2.VoteReply(**reply)
+        vote_granted = self.on_vote_request(
+            request.term, request.candidateId, request.lastLogIndex + 1, request.lastLogTerm
+        )
+        return pb2.VoteReply(
+            term=self.current_term,
+            voteGranted=vote_granted
+        )
     
     ### RUNNERS ###
-    
+
+    def run_follower(self):
+        self.election_timer = self.reset_timer(
+            self.election_timer, random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), self.start_election
+        )
+
+    def run_candidate(self):
+        self.start_election()
+
     def run_leader(self):
         self.leader_heartbeat()
     
-    def run_candidate(self):
-        self.start_election()
-        if len(self.votes_received) >= len(self.membership_ids) // 2 + 1:
-            self.current_role = 'Leader'
-            self.current_leader = self.node_id
-        else:
-            self.current_role = 'Follower'
-        time.sleep(random())
-    
-    def run_follower(self):
-        # TODO: Check for leader heartbeat, if None, self.current_role = 'Candidate'
-        pass
-    
     def run(self):
-        if self.current_role == 'Leader':
-            self.run_leader()
+        if self.current_role == 'Follower':
+            self.run_follower()
         elif self.current_role == 'Candidate':
             self.run_candidate()
         else:
-            self.run_follower()
+            self.run_leader()
+        time.sleep(0.1)
             

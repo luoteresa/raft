@@ -1,4 +1,4 @@
-import grpc
+import grpc # type: ignore
 import server_pb2_grpc
 import server_pb2
 import server
@@ -20,11 +20,11 @@ class FrontEndHandler(server_pb2_grpc.FrontEndServicer):
                 
                 # Send GetState request to check if this node is the leader
                 if operation == "Get":
-                    result = kv_stub.Get(server_pb2.GetKey(request.key, request.client_id, request.request_id))
+                    result = kv_stub.Get(server_pb2.GetKey(request.key, request.ClientId, request.RequestId))
                 elif operation == "Put":
-                    result = kv_stub.Put(server_pb2.KeyValue(request.key, request.value, request.client_id, request.request_id))
+                    result = kv_stub.Put(server_pb2.KeyValue(request.key, request.value, request.ClientId, request.RequestId))
                 elif operation == "Replace":
-                    result = kv_stub.Replace(server_pb2.KeyValue(request.key, request.value, request.client_id, request.request_id))
+                    result = kv_stub.Replace(server_pb2.KeyValue(request.key, request.value, request.ClientId, request.RequestId))
 
                 if not result.wrongLeader:
                     print(f"Leader found at port {port}")
@@ -41,7 +41,7 @@ class FrontEndHandler(server_pb2_grpc.FrontEndServicer):
     def Get(self, request, context):
         channel = grpc.insecure_channel(self.leader_port)
         kv_stub = server_pb2_grpc.KeyValueStoreStub(channel)
-        leader_get = kv_stub.Get(server_pb2.GetKey(request.key, request.client_id, request.request_id))
+        leader_get = kv_stub.Get(server_pb2.GetKey(request.key, request.ClientId, request.RequestId))
         
         while not leader_get or leader_get.wrongLeader:
             leader_get = self.broadcast_for_leader(request, "Get")
@@ -53,7 +53,7 @@ class FrontEndHandler(server_pb2_grpc.FrontEndServicer):
     def Put(self, request, context):
         channel = grpc.insecure_channel(self.leader_port)
         kv_stub = server_pb2_grpc.KeyValueStoreStub(channel)
-        leader_put = kv_stub.Get(server_pb2.GetKey(request.key, request.client_id, request.request_id))
+        leader_put = kv_stub.Get(server_pb2.GetKey(request.key, request.ClientId, request.RequestId))
         
         while not leader_put or leader_put.wrongLeader:
             leader_put = self.broadcast_for_leader(request, "Put")
@@ -65,7 +65,7 @@ class FrontEndHandler(server_pb2_grpc.FrontEndServicer):
     def Replace(self, request, context):
         channel = grpc.insecure_channel(self.leader_port)
         kv_stub = server_pb2_grpc.KeyValueStoreStub(channel)
-        leader_replace = kv_stub.Get(server_pb2.GetKey(request.key, request.client_id, request.request_id))
+        leader_replace = kv_stub.Get(server_pb2.GetKey(request.key, request.ClientId, request.RequestId))
         
         while not leader_replace or leader_replace.wrongLeader:
             leader_replace = self.broadcast_for_leader(request, "Replace")
