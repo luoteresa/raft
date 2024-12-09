@@ -3,6 +3,11 @@ import server_pb2 as pb2
 import server_pb2_grpc as pb2_grpc
 import random
 import time
+from threading import Thread, Timer
+
+ELECTION_TIMEOUT_MIN = 1.0  # 1 second
+ELECTION_TIMEOUT_MAX = 1.5  # Slight randomization to avoid split votes
+HEARTBEAT_INTERVAL = 0.1 # 10 heartbeats per second
 
 class LogEntry:
     def __init__(self, key, value, term):
@@ -33,6 +38,13 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
             channel = grpc.insecure_channel(f"localhost:{7000 + member_id}")
             raft_stub = pb2.RaftStub(channel)
             self.raft_peers[member_id] = raft_stub
+    
+    def reset_election_timer(self):
+        if self.election_timer:
+            self.election_timer.cancel()
+        timeout = random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX)
+        self.election_timer = Timer(timeout, self.start_election)
+        self.election_timer.start()
 
     # Invoked by: Follower (who suspects Leader fail), Candidate
     def start_election(self):
@@ -43,6 +55,7 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
         log_term = self.log[-1].term if len(self.log) else 0 
         
         # Broadcast VoteRequest to all members
+        vote_threads = []
         for node_id in self.membership_ids:
             if node_id != self.node_id:
                 request = pb2.VoteRequest(
@@ -51,12 +64,18 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
                     lastLogIndex=len(self.log),
                     lastLogTerm=log_term
                 )
-                try:
-                    # TODO: Thread so not blocked waiting for every node to respond
-                    response = self.raft_peers[node_id].RequestVote(request)
-                    self.on_vote_response(node_id, response.term, response.voteGranted)
-                except grpc.RpcError as e:
-                    print(f"Error contacting node {node_id}: {e}")
+                thread = Thread(target=self.send_vote_request, args=(request, node_id))
+                vote_threads.append(thread)
+
+        self.reset_election_timer()      
+    
+    def send_vote_request(self, request, node_id):
+        try:
+            # TODO: Thread so not blocked waiting for every node to respond
+            response = self.raft_peers[node_id].RequestVote(request)
+            self.on_vote_response(node_id, response.term, response.voteGranted)
+        except grpc.RpcError as e:
+            print(f"Error contacting node {node_id}: {e}")
 
     # Invoked by: Follower, Candidate, Leader
     # RequestVote RPC
@@ -196,13 +215,24 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
         self.votes_received = set()
         self.sent_length = {}
         self.acked_length = {}
+
+    def reset_heartbeat_timer(self):
+        if self.heartbeat_timer:
+            self.heartbeat_timer.cancel()
+        self.heartbeat_timer = Timer(HEARTBEAT_INTERVAL, self.leader_heartbeat)
+        self.heartbeat_timer.start()
     
     # Invoked by: Leader
     def leader_heartbeat(self):
         if self.current_role == 'Leader':
+            threads = []
             for follower_id in self.membership_ids:
                 if follower_id != self.node_id:
-                    self.replicate_log(self.node_id, follower_id)
+                    thread = Thread(self.replicate_log, kwargs={"leader_id": self.node_id, "follower_id": follower_id})
+                    thread.start()
+                    threads.append(thread)
+            
+            self.reset_heartbeat_timer()
         
     ### GRPC IMPLEMENTATIONS ###
     
