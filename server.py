@@ -17,7 +17,7 @@ class LogEntry:
         self.term = term
 
 class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
-    def __init__(self, node_id, membership_ids, port):
+    def __init__(self, node_id, membership_ids, port, verbose=False):
         self.node_id = node_id # Unique ID for self
         self.membership_ids = membership_ids # List of node IDs
         self.port = port # Port number to listen on
@@ -34,7 +34,15 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
         self.kv_store = {} # Key value store
         self.election_timer = None
         self.heartbeat_timer = None
+        self.initialize_sent_acked_length()
         self.initialize_connections()
+        
+        self.verbose = verbose
+
+    def initialize_sent_acked_length(self):
+        for node_id in self.membership_ids:
+            self.sent_length[node_id] = 0
+            self.acked_length[node_id] = 0
 
     def initialize_connections(self):
         for member_id in self.membership_ids:
@@ -52,6 +60,16 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
 
     # Invoked by: Follower (who suspects Leader fail), Candidate
     def start_election(self):
+        if self.current_role == 'Leader':
+            return
+        
+        if self.verbose:
+            print("STARTING ELECTION ON ", self.port)
+
+        # Cancel heartbeat if transitioning from Leader to Candidate
+        if self.heartbeat_timer:
+            self.heartbeat_timer.cancel()
+        
         self.current_term += 1
         self.current_role = 'Candidate'
         self.voted_for = self.node_id
@@ -92,7 +110,7 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
         candidate_log_better = (candidate_log_term > log_term) or \
             (candidate_log_term == log_term and candidate_log_length > len(self.log))
         
-        if candidate_term == self.term and candidate_log_better and self.voted_for in [candidate_id, None]:
+        if candidate_term == self.current_term and candidate_log_better and self.voted_for in [candidate_id, None]:
             self.voted_for = candidate_id
             return True
         else:
@@ -107,6 +125,8 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
                 self.current_leader = self.node_id
                 if self.election_timer:
                     self.election_timer.cancel()
+                # Start sending heartbeats
+                self.leader_heartbeat()  
 
                 def replicate_to_follower(follower_id):
                     self.sent_length[follower_id] = len(self.log)
@@ -122,7 +142,11 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
             self.current_role = 'Follower'
             self.voted_for = None
             if self.election_timer:
-                self.election_timer.cancel()
+                self.election_timer = self.reset_timer(
+                    self.election_timer, 
+                    random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), 
+                    self.start_election
+                )
 
     # Invoked by: Follower
     def append_entries(self, prefix_length, leader_commit, entries):
@@ -193,10 +217,24 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
             self.current_term = term
             self.voted_for = None
             if self.election_timer:
-                self.election_timer.cancel()
+                self.election_timer = self.reset_timer(
+                    self.election_timer, 
+                    random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), 
+                    self.start_election
+                )
+            return 0, False
         elif term == self.current_term:
             self.current_role = 'Follower' 
             self.current_leader = leader_id
+
+            # Additional timer reset NOT IN psuedocode
+            if self.election_timer: 
+                self.election_timer = self.reset_timer(
+                    self.election_timer, 
+                    random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), 
+                    self.start_election
+                )
+
             log_ok = (len(self.log) >= prefix_length) and \
                 (prefix_length == 0 or self.log[-1].term == prefix_term)
             if log_ok:
@@ -220,8 +258,12 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
                 self.current_term = term
                 self.current_role = 'Follower'
                 self.voted_for = None
-                if self.election_timer:
-                    self.election_timer.cancel()
+                if self.election_timer: 
+                    self.election_timer = self.reset_timer(
+                        self.election_timer, 
+                        random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), 
+                        self.start_election
+                    )
                 
     # Invoked by: All            
     def crash_recovery(self):
@@ -350,7 +392,6 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
             request.prefixTerm, request.leaderCommit, request.entries
         )
         return pb2.AppendEntriesReply(
-            followerId=self.node_id,
             term=self.current_term,
             newAckedLength=new_acked_length,
             success=success
@@ -368,22 +409,45 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
     ### RUNNERS ###
 
     def run_follower(self):
-        self.election_timer = self.reset_timer(
-            self.election_timer, random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), self.start_election
-        )
+        if self.verbose:
+            print("RUNNING FOLLOWER ON",  self.port)
+        if not self.election_timer:
+            if self.verbose:
+                print("Starting election timer on", self.port)
+            self.election_timer = self.reset_timer(
+                self.election_timer, 
+                random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), 
+                self.start_election
+            )
 
     def run_candidate(self):
+        if self.verbose:
+            print("RUNNING CANDIDATE ON", self.port)
         self.start_election()
 
     def run_leader(self):
-        self.leader_heartbeat()
+        if self.verbose:
+            print("RUNNING LEADER ON",  self.port)
+        if not self.heartbeat_timer:
+            self.leader_heartbeat()
     
     def run(self):
-        if self.current_role == 'Follower':
-            self.run_follower()
-        elif self.current_role == 'Candidate':
-            self.run_candidate()
-        else:
-            self.run_leader()
-        time.sleep(0.1)
+        print(self.port)
+
+        while True:
             
+            if self.current_role == 'Follower':
+                self.run_follower()
+            elif self.current_role == 'Candidate':
+                self.run_candidate()
+            else:
+                self.run_leader()
+            time.sleep(0.1)
+    
+    def start_raft(self):
+        self.election_timer = self.reset_timer(
+            None,
+            random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX),
+            self.start_election
+        )
+        threading.Thread(target=self.run, daemon=True).start()
