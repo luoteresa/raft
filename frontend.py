@@ -4,6 +4,7 @@ import server_pb2
 import server
 import threading
 from concurrent import futures
+from multiprocessing import Process
 
 class FrontEndHandler(server_pb2_grpc.FrontEndServicer):
 
@@ -75,7 +76,24 @@ class FrontEndHandler(server_pb2_grpc.FrontEndServicer):
 
         return server_pb2.Reply(**reply)
 
+        # frontend.py
+
+
     def StartRaft(self, request, context):
+        num_nodes = request.arg
+        processes = []
+
+        for node_id in range(1, num_nodes + 1):
+            # Create a new process for each server
+            p = Process(target=server.start_server, args=(node_id, num_nodes))
+            p.start()
+            processes.append(p)
+
+        print("All servers have been started as separate processes.")
+
+        return server_pb2.Reply(wrongLeader=False, error="", value="")
+
+    #def StartRaft(self, request, context):
         # num_nodes = request.arg
         # port = 9000
         # raft_port = 7000
@@ -120,33 +138,33 @@ class FrontEndHandler(server_pb2_grpc.FrontEndServicer):
         # # Wait for all servers to terminate
         # for cur_server in servers:
         #     cur_server.wait_for_termination()
-        num_nodes = request.arg 
-        port = 9000
-        raft_port = 7000
-        threads = []
+        # num_nodes = request.arg 
+        # port = 9000
+        # raft_port = 7000
+        # threads = []
 
-        for i in range(1, num_nodes + 1):
-            def start_server(node_id):
-                raft_server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-                handler = server.ServerHandler(node_id, list(range(1, num_nodes + 1)), f"localhost:{port + node_id}", True)
+        # for i in range(1, num_nodes + 1):
+        #     def start_server(node_id):
+        #         raft_server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+        #         handler = server.ServerHandler(node_id, list(range(1, num_nodes + 1)), f"localhost:{port + node_id}", True)
 
-                server_pb2_grpc.add_KeyValueStoreServicer_to_server(handler, raft_server)
-                server_pb2_grpc.add_RaftServicer_to_server(handler, raft_server)
+        #         server_pb2_grpc.add_KeyValueStoreServicer_to_server(handler, raft_server)
+        #         server_pb2_grpc.add_RaftServicer_to_server(handler, raft_server)
                 
-                raft_server.add_insecure_port(f"localhost:{port + node_id}")
-                raft_server.add_insecure_port(f"localhost:{raft_port + node_id}")
+        #         raft_server.add_insecure_port(f"localhost:{port + node_id}")
+        #         raft_server.add_insecure_port(f"localhost:{raft_port + node_id}")
 
-                # Start the server in a separate thread
-                def serve():
-                    raft_server.start()
-                    print(f"Node {node_id} started on ports {port + node_id} and {raft_port + node_id}")
-                    threading.Thread(target=handler.run, daemon=True).start()  # Run RAFT protocol
-                    raft_server.wait_for_termination()
+        #         # Start the server in a separate thread
+        #         def serve():
+        #             raft_server.start()
+        #             print(f"Node {node_id} started on ports {port + node_id} and {raft_port + node_id}")
+        #             threading.Thread(target=handler.run, daemon=True).start()  # Run RAFT protocol
+        #             raft_server.wait_for_termination()
 
-                thread = threading.Thread(target=serve, daemon=True)
-                thread.start()
-                threads.append(thread)
+        #         thread = threading.Thread(target=serve, daemon=True)
+        #         thread.start()
+        #         threads.append(thread)
 
-            start_server(i)
+        #     start_server(i)
 
-        return server_pb2.Reply(wrongLeader=False, error="", value="")
+        # return server_pb2.Reply(wrongLeader=False, error="", value="")
