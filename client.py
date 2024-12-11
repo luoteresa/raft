@@ -49,13 +49,13 @@ if __name__ == '__main__':
     frontend_server.add_insecure_port("localhost:8001")
     frontend_server.start()
 
-    client = Client()
+    # client = Client()
 
-    start_result = client.StartRaft(5)
-    if start_result == "ERROR":
-        print("FAILED START RAFT FOR 5 NODES")
+    # start_result = client.StartRaft(5)
+    # if start_result == "ERROR":
+    #     print("FAILED START RAFT FOR 5 NODES")
     
-    time.sleep(10)
+    # time.sleep(10)
 
     # result = client.Put("key1", "10")
     # result = client.Get("key1")

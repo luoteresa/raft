@@ -6,8 +6,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-ELECTION_TIMEOUT_MIN = 0.8 
-ELECTION_TIMEOUT_MAX = 1.2 
+ELECTION_TIMEOUT_MIN = 0.75
+ELECTION_TIMEOUT_MAX = 1.5
 HEARTBEAT_INTERVAL = 0.2 # 5 heartbeats per second
 
 class LogEntry:
@@ -64,11 +64,7 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
             return
         
         if self.verbose:
-            print("STARTING ELECTION ON ", self.port)
-
-        # Cancel heartbeat if transitioning from Leader to Candidate
-        if self.heartbeat_timer:
-            self.heartbeat_timer.cancel()
+            print(f"STARTING ELECTION ON {self.port} {self.node_id}")
         
         self.current_term += 1
         self.current_role = 'Candidate'
@@ -85,8 +81,9 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
             )
             try:
                 response = self.raft_peers[node_id].RequestVote(request)
-                print(f"NODE {self.node_id} RECEIVED VOTE FROM NODE ", node_id)
-                print(f"NODE {self.node_id} HAS {self.votes_received} VOTES")
+                if self.verbose:
+                    print(f"NODE {self.node_id} RECEIVED VOTE FROM NODE ", node_id)
+                    print(f"NODE {self.node_id} HAS VOTES FROM {self.votes_received}")
                 self.on_vote_response(node_id, response.term, response.voteGranted)
             except grpc.RpcError as e:
                 print(f"Error contacting node {node_id}: {e}")
@@ -104,9 +101,9 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
     # RequestVote RPC
     def on_vote_request(self, candidate_id, candidate_term, candidate_log_length, candidate_log_term):
         if candidate_term > self.current_term:
-                self.current_term = candidate_term
-                self.current_role = 'Follower'
-                self.voted_for = None
+            self.current_term = candidate_term
+            self.current_role = 'Follower'
+            self.voted_for = None
         
         log_term = self.log[-1].term if len(self.log) else 0
         candidate_log_better = (candidate_log_term > log_term) or \
@@ -120,9 +117,7 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
         
     # Invoked by: Candidate
     def on_vote_response(self, voter_id, term, granted):
-        
         if self.current_term == term and granted:
-            print(f"Node {self.node_id} got a vote from Node {voter_id} in term {term}")
             self.votes_received.add(voter_id)
             if len(self.votes_received) >= len(self.membership_ids) // 2 + 1:
                 print(f"Node {self.node_id} got the majority and is now leader")
@@ -130,8 +125,8 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
                 self.current_leader = self.node_id
                 if self.election_timer:
                     self.election_timer.cancel()
+                    
                 # Start sending heartbeats
-                print(f"Sending a heartbeat from newly elected leader node Node {self.node_id}")
                 self.leader_heartbeat()  
 
                 def replicate_to_follower(follower_id):
@@ -144,12 +139,10 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
                         if follower_id != self.node_id:
                             executor.submit(replicate_to_follower, follower_id)
         elif term > self.current_term:
-            print(f"Node {self.current_term} is less than Node {voter_id} with term {term}")
             self.current_term = term
             self.current_role = 'Follower'
             self.voted_for = None
-            if self.election_timer:
-                self.election_timer = self.reset_timer(
+            self.election_timer = self.reset_timer(
                     self.election_timer, 
                     random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), 
                     self.start_election
@@ -194,7 +187,6 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
             self.commit_length = highest_length
     
     # Invoked by: Leader
-    # LogRequest w/ empty suffix serves as heartbeat to let Followers know Leader still alive
     def replicate_log(self, leader_id, follower_id):
         prefix_length = self.sent_length[follower_id]
         suffix = self.log[prefix_length:]
@@ -207,16 +199,23 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
             leaderCommit=self.commit_length,
             entries=[pb2.LogEntry(term=entry.term, key=entry.key, value=entry.value) for entry in suffix]
         )
+        
+        try:
+            response = self.raft_peers[follower_id].AppendEntries(request)
+            print(f"Just sent log replicate/heartbeat message from Node {leader_id} to node {follower_id}. Currently on node {self.node_id}")
+            self.on_log_response(follower_id, response.term, response.newAckedLength, response.success)
+        except grpc.RpcError as e:
+            print(f"Error replicating log to node {follower_id}: {e}")
 
-        def send_append_entries():
-            try:
-                response = self.raft_peers[follower_id].AppendEntries(request)
-                print(f"Just sent log replicate/heartbeat message from Node {leader_id} to node {follower_id}. Currently on node {self.node_id}")
-                self.on_log_response(follower_id, response.term, response.newAckedLength, response.success)
-            except grpc.RpcError as e:
-                print(f"Error replicating log to node {follower_id}: {e}")
+        # def send_append_entries():
+        #     try:
+        #         response = self.raft_peers[follower_id].AppendEntries(request)
+        #         print(f"Just sent log replicate/heartbeat message from Node {leader_id} to node {follower_id}. Currently on node {self.node_id}")
+        #         self.on_log_response(follower_id, response.term, response.newAckedLength, response.success)
+        #     except grpc.RpcError as e:
+        #         print(f"Error replicating log to node {follower_id}: {e}")
 
-        threading.Thread(target=send_append_entries).start()
+        # threading.Thread(target=send_append_entries).start()
     
     # Invoked by: Follower
     # Equivalent to AppendEntries RPC in paper, is a wrapper that also checks for term
@@ -224,63 +223,56 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
         if term > self.current_term:
             self.current_term = term
             self.voted_for = None
-            if self.election_timer:
-                self.election_timer = self.reset_timer(
-                    self.election_timer, 
-                    random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), 
-                    self.start_election
-                )
-            return 0, False
-        elif term == self.current_term:
+            # self.election_timer = self.reset_timer(
+            #     self.election_timer, 
+            #     random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), 
+            #     self.start_election
+            # )
+        if term == self.current_term:
             self.current_role = 'Follower' 
             self.current_leader = leader_id
+        
+        # Additional timer reset NOT IN psuedocode
+        self.election_timer = self.reset_timer(
+                self.election_timer, 
+                random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), 
+                self.start_election
+            )
 
-            # Additional timer reset NOT IN psuedocode
-            if self.election_timer: 
-                self.election_timer = self.reset_timer(
-                    self.election_timer, 
-                    random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), 
-                    self.start_election
-                )
-
-            log_ok = (len(self.log) >= prefix_length) and \
-                (prefix_length == 0 or self.log[-1].term == prefix_term)
-            if log_ok:
-                self.append_entries(prefix_length, leader_commit, entries)
-                new_acked_length = prefix_length + len(entries)
-                return new_acked_length, True
-            else:
-                return 0, False
+        log_ok = (len(self.log) >= prefix_length) and \
+            (prefix_length == 0 or self.log[-1].term == prefix_term)
+        if log_ok:
+            self.append_entries(prefix_length, leader_commit, entries)
+            new_acked_length = prefix_length + len(entries)
+            return new_acked_length, True
+        else:
+            return 0, False
             
     # Invoked by: Leader
     def on_log_response(self, follower_id, term, new_acked_length, success):
         if term == self.current_term and self.current_role == 'Leader':
             if success and new_acked_length >= self.acked_length[follower_id]:
-                print(f"success and the new acked length {new_acked_length} more than follower's ack length {self.acked_length[follower_id]}")
-                # if self.verbose:
-                #     print("COMMITTING ENTRIES ON LOG RESPONSE")
                 self.sent_length[follower_id] = new_acked_length
                 self.acked_length[follower_id] = new_acked_length
                 self.commit_log_entries()
             elif self.sent_length[follower_id] > 0:
-                print(f"Follower's sent length > 0 {self.sent_length[follower_id]}")
                 self.sent_length[follower_id] -= 1
-                # if self.verbose:
-                #     print(f"REPLICATING LOG 257")
-
                 self.replicate_log(self.node_id, follower_id)
             elif term > self.current_term:
-                if self.verbose:
-                    print(f"[Node {self.node_id}] Transitioning from {self.current_role} to Follower (Term {term})")
                 self.current_term = term
                 self.current_role = 'Follower'
                 self.voted_for = None
-                if self.election_timer: 
-                    self.election_timer = self.reset_timer(
-                        self.election_timer, 
-                        random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), 
-                        self.start_election
-                    )
+                
+                if self.heartbeat_timer:
+                    self.heartbeat_timer.cancel()
+                    self.heartbeat_timer = None
+                
+                self.election_timer = self.reset_timer(
+                    self.election_timer, 
+                    random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), 
+                    self.start_election
+                )
+                    
                 
     # Invoked by: All            
     def crash_recovery(self):
@@ -300,10 +292,9 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
                 if follower_id != self.node_id:
                     executor.submit(send_heartbeat, follower_id)
 
-        if not self.heartbeat_timer:
-            self.heartbeat_timer = self.reset_timer(
-                self.heartbeat_timer, HEARTBEAT_INTERVAL, self.leader_heartbeat
-            )
+        self.heartbeat_timer = self.reset_timer(
+            self.heartbeat_timer, HEARTBEAT_INTERVAL, self.leader_heartbeat
+        )
             
     ### GRPC IMPLEMENTATIONS ###
     
@@ -426,38 +417,36 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
     
     ### RUNNERS ###
 
-    def run_follower(self):
-        if self.verbose:
-            print("Running as a follower on",  self.port)
-        if not self.election_timer:
-            if self.verbose:
-                print("Starting election timer on", self.port)
-            self.election_timer = self.reset_timer(
-                self.election_timer, 
-                random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), 
-                self.start_election
-            )
+    # def run_follower(self):
+    #     if self.verbose:
+    #         print(f"Running as a follower on {self.port} {self.node_id}")
+    #     if not self.election_timer:
+    #         self.election_timer = self.reset_timer(
+    #             self.election_timer, 
+    #             random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), 
+    #             self.start_election
+    #         )
 
-    def run_candidate(self):
-        if self.verbose:
-            print("Running as a candidate on", self.port)
-        self.start_election()
+    # def run_candidate(self):
+    #     if self.verbose:
+    #        print(f"Running as a candidate on {self.port} {self.node_id}")
+    #     # self.start_election()
 
-    def run_leader(self):
-        if self.verbose:
-            print("Running as a leader on ",  self.port)
-        if not self.heartbeat_timer:
-            self.leader_heartbeat()
+    # def run_leader(self):
+    #     if self.verbose:
+    #         print(f"Running as a leader on {self.port} {self.node_id}")
+    #     if not self.heartbeat_timer:
+    #         self.leader_heartbeat()
     
-    def run(self):
-        print(self.port)
-        if self.current_role == 'Follower':
-            self.run_follower()
-        elif self.current_role == 'Candidate':
-            self.run_candidate()
-        else:
-            self.run_leader()
-        time.sleep(0.1)
+    # def run(self):
+        # if self.current_role == 'Follower':
+        #     self.run_follower()
+        # elif self.current_role == 'Candidate':
+        #     self.run_candidate()
+        # else:
+        #     self.run_leader()
+        # time.sleep(0.1)
+            
     
     def start_raft(self):
         self.election_timer = self.reset_timer(
@@ -465,7 +454,8 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
             random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX),
             self.start_election
         )
-        threading.Thread(target=self.run, daemon=True).start()
+        # threading.Thread(target=self.run, daemon=True).start()
+        # threading.Thread(target=self.run_follower, daemon=True).start()
     
 def start_server(node_id, num_nodes, base_port=9000, raft_base_port=7000):
     """Starts a single gRPC server for the given node_id."""
@@ -491,7 +481,8 @@ def start_server(node_id, num_nodes, base_port=9000, raft_base_port=7000):
 
     # Start the RAFT logic in a background thread
     # threading.Thread(target=handler.run, daemon=True).start()
-    handler.run()
+    # handler.run()
+    handler.start_raft()
 
     # Start the gRPC server
     raft_server.start()
