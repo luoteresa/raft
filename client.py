@@ -49,18 +49,52 @@ if __name__ == '__main__':
     frontend_server.add_insecure_port("localhost:8001")
     frontend_server.start()
 
-    # client = Client()
-
-    # start_result = client.StartRaft(5)
-    # if start_result == "ERROR":
-    #     print("FAILED START RAFT FOR 5 NODES")
+    channel = grpc.insecure_channel("localhost:8001")
+    # stub = server_pb2_grpc.FrontEndStub(channel)
     
-    # time.sleep(10)
+    # stub.StartRaft(server_pb2.IntegerArg(arg=5))
+    
+    # time.sleep(5)
 
-    # result = client.Put("key1", "10")
-    # result = client.Get("key1")
-    # result = client.Replace("key1", "20")
-    # result = client.Get("key2")
+    # result = stub.Put(server_pb2.KeyValue(key="key1", value="10", ClientId=1, RequestId=1)) # returns "10"
+    # print("FINISHED PUT KEY1 10")
+    # print("PUT KEY1 10 RESULT SHOULD BE 10", result)
+    # result = stub.Get(server_pb2.GetKey(key="key1", ClientId=1, RequestId=2)) # returns "10"
+    # print("FINISHED GET KEY1")
+    # print("GET KEY1 RESULT SHOULD BE 10", result)
+    # result = stub.Replace(server_pb2.KeyValue(key="key1", value="20", ClientId=1, RequestId=3)) # returns "20"
+    # print("FINISHED REPLACE KEY1 20")
+    # print("REPLACE KEY1 20 RESULT SHOULD BE 20", result)
+    # result = stub.Get(server_pb2.GetKey(key="key1", ClientId=1, RequestId=4)) # returns "20"
+    # print("FINISHED GET KEY1")
+    # print("GET KEY1 RESULT SHOULD BE 20", result)
+    # result = stub.Get(server_pb2.GetKey(key="key2", ClientId=1, RequestId=5)) # returns error
+    # print("FINISHED GET KEY2")
+    # print("GET KEY2 RESULT SHOULD BE ERROR", result)
+    # result = stub.Put(server_pb2.KeyValue(key="key2", value="30", ClientId=1, RequestId=6)) # add key2, returns "30"
+    # print("FINISHED PUT KEY2 30")
+    # print("PUT KEY2 30 RESULT SHOULD BE 30", result)
+    # result = stub.Get(server_pb2.GetKey(key="key2", ClientId=1, RequestId=5)) # returns "30"
+    # print("FINISHED GET KEY2")
+    # print("GET KEY2 RESULT SHOULD BE 30", result)
+    # result = stub.Replace(server_pb2.KeyValue(key="key3", value="40", ClientId=1, RequestId=7)) # returns error
+    # print("FINISHED REPLACE KEY3 40")
+    # print("REPLACE KEY3 40 RESULT SHOULD BE ERROR", result)
+
+    
+
+    # # client = Client()
+
+    # # start_result = client.StartRaft(5)
+    # # if start_result == "ERROR":
+    # #     print("FAILED START RAFT FOR 5 NODES")
+    
+    # # time.sleep(10)
+
+    # # result = client.Put("key1", "10")
+    # # result = client.Get("key1")
+    # # result = client.Replace("key1", "20")
+    # # result = client.Get("key2")
 
 
     while True:

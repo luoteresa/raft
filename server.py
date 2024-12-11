@@ -180,7 +180,7 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
             if self.get_acks_for_length(length) >= minimum_acks and length > highest_length:
                 highest_length = length
         if highest_length != -1 and highest_length > self.commit_length and self.log[highest_length - 1].term == self.current_term:
-            for i in range(self.commit_length, highest_length - 1):
+            for i in range(self.commit_length - 1, highest_length):
                 # TODO: Deliver log[i].msg to the application -- Done in the RPC implementation
                 log_entry = self.log[i]
                 self.kv_store[log_entry.key] = log_entry.value
@@ -202,7 +202,9 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
         
         try:
             response = self.raft_peers[follower_id].AppendEntries(request)
-            print(f"Just sent log replicate/heartbeat message from Node {leader_id} to node {follower_id}. Currently on node {self.node_id}")
+            # if self.verbose:
+            #     if len(suffix) > 0:
+            #         print(f"replicate_log; successfully finished AppendEntries into {follower_id}")
             self.on_log_response(follower_id, response.term, response.newAckedLength, response.success)
         except grpc.RpcError as e:
             print(f"Error replicating log to node {follower_id}: {e}")
@@ -234,18 +236,27 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
         
         # Additional timer reset NOT IN psuedocode
         self.election_timer = self.reset_timer(
-                self.election_timer, 
-                random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), 
-                self.start_election
-            )
+            self.election_timer, 
+            random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), 
+            self.start_election
+        )
+        # if self.verbose:
+        #     if len(entries) > 0:
+        #         print(f"on_log_request at {self.node_id}")
 
         log_ok = (len(self.log) >= prefix_length) and \
             (prefix_length == 0 or self.log[-1].term == prefix_term)
         if log_ok:
             self.append_entries(prefix_length, leader_commit, entries)
             new_acked_length = prefix_length + len(entries)
+            # if self.verbose:
+            #     if len(entries) > 0:
+            #         print(f"on_log_request at {self.node_id}; new acked length {new_acked_length}")
             return new_acked_length, True
         else:
+            # if self.verbose:
+            #     if len(entries) > 0:
+            #         print(f"on_log_request at {self.node_id}; log NOT OKAY")
             return 0, False
             
     # Invoked by: Leader
@@ -285,6 +296,8 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
     # Invoked by: Leader
     def leader_heartbeat(self):
         def send_heartbeat(follower_id):
+            # if self.verbose:
+            #     print(f"Sending heartbeat from leader {self.node_id} to {follower_id}")
             self.replicate_log(self.node_id, follower_id)
 
         with ThreadPoolExecutor() as executor:
@@ -333,29 +346,47 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
         log_entry = LogEntry(request.key, request.value, self.current_term)
         self.log.append(log_entry)
         self.acked_length[self.node_id] = len(self.log)
+        
+        if self.verbose:
+            print(f"GRPC Put {request.key}, {request.value} at node {self.node_id}")
 
         with ThreadPoolExecutor() as executor:
             for follower_id in self.membership_ids:
                 if follower_id != self.node_id:
                     executor.submit(self.replicate_log, self.node_id, follower_id)
+                    
 
-        while len(self.log) > self.commit_length:
-            self.commit_log_entries()
+        # Wait for majority acknowledgment
+        minimum_acks = len(self.membership_ids) // 2 + 1
+        while self.get_acks_for_length(len(self.log)) < minimum_acks:
+            time.sleep(0.01)
+            
+        # if self.verbose:
+        #     print(f"GRPC Put; acks for length: {self.get_acks_for_length(len(self.log))}")
+        if self.verbose:
+            print(f"GRPC Put store at node {self.node_id}: {self.kv_store}")
+
+        # Check if the log entry has been committed and update the key-value store
+        self.commit_log_entries()
 
         if request.key in self.kv_store and self.kv_store[request.key] == request.value:
+            # if self.verbose:
+            #     print(f"Put {request.key}, {request.value} SUCCESS")
             return pb2.Reply(
                 wrongLeader=False,
                 error="",
                 value=request.value
             )
         else:
+            # if self.verbose:
+            #     print(f"Put {request.key}, {request.value} FAILED")
             return pb2.Reply(
                 wrongLeader=False,
                 error="Failed to commit the log entry.",
                 value=""
             )
 
-    def Replace(self, request, context):
+    def Replace(self, request, context): 
         if self.current_role != 'Leader':
             return pb2.Reply(
                 wrongLeader=True,
@@ -379,8 +410,18 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
                 if follower_id != self.node_id:
                     executor.submit(self.replicate_log, self.node_id, follower_id)
 
-        while len(self.log) > self.commit_length:
-            self.commit_log_entries()
+        # Wait for majority acknowledgment
+        minimum_acks = len(self.membership_ids) // 2 + 1
+        while self.get_acks_for_length(len(self.log)) < minimum_acks:
+            time.sleep(0.01)
+            
+        # if self.verbose:
+        #     print(f"GRPC Replace; acks for length: {self.get_acks_for_length(len(self.log))}")
+        #     print(f"Last log entry:", self.log[-1].key, self.log[-1].value)
+        #     print("Store: ", self.kv_store)
+
+        # Check if the log entry has been committed and update the key-value store
+        self.commit_log_entries()
 
         if request.key in self.kv_store and self.kv_store[request.key] == request.value:
             return pb2.Reply(
@@ -416,38 +457,7 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
         )
     
     ### RUNNERS ###
-
-    # def run_follower(self):
-    #     if self.verbose:
-    #         print(f"Running as a follower on {self.port} {self.node_id}")
-    #     if not self.election_timer:
-    #         self.election_timer = self.reset_timer(
-    #             self.election_timer, 
-    #             random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), 
-    #             self.start_election
-    #         )
-
-    # def run_candidate(self):
-    #     if self.verbose:
-    #        print(f"Running as a candidate on {self.port} {self.node_id}")
-    #     # self.start_election()
-
-    # def run_leader(self):
-    #     if self.verbose:
-    #         print(f"Running as a leader on {self.port} {self.node_id}")
-    #     if not self.heartbeat_timer:
-    #         self.leader_heartbeat()
-    
-    # def run(self):
-        # if self.current_role == 'Follower':
-        #     self.run_follower()
-        # elif self.current_role == 'Candidate':
-        #     self.run_candidate()
-        # else:
-        #     self.run_leader()
-        # time.sleep(0.1)
             
-    
     def start_raft(self):
         self.election_timer = self.reset_timer(
             None,
@@ -479,9 +489,7 @@ def start_server(node_id, num_nodes, base_port=9000, raft_base_port=7000):
     raft_server.add_insecure_port(f"localhost:{port}")
     raft_server.add_insecure_port(f"localhost:{raft_port}")
 
-    # Start the RAFT logic in a background thread
-    # threading.Thread(target=handler.run, daemon=True).start()
-    # handler.run()
+    # Start RAFT protocol for leader election
     handler.start_raft()
 
     # Start the gRPC server

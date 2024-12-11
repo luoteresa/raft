@@ -10,7 +10,7 @@ class FrontEndHandler(server_pb2_grpc.FrontEndServicer):
 
     def __init__(self):
         self.peers = {}
-        self.leader_port = None
+        self.leader_port = "localhost:9001"
         self.success_requests = 0
 
     def broadcast_for_leader(self, request, operation):
@@ -18,7 +18,7 @@ class FrontEndHandler(server_pb2_grpc.FrontEndServicer):
         for port, channel in self.peers.items():
             try:
                 # Create stub for the current peer
-                kv_stub = server_pb2.KeyValueStoreStub(channel)
+                kv_stub = server_pb2_grpc.KeyValueStoreStub(channel)
                 
                 # Send GetState request to check if this node is the leader
                 if operation == "Get":
@@ -43,7 +43,7 @@ class FrontEndHandler(server_pb2_grpc.FrontEndServicer):
     def Get(self, request, context):
         channel = grpc.insecure_channel(self.leader_port)
         kv_stub = server_pb2_grpc.KeyValueStoreStub(channel)
-        leader_get = kv_stub.Get(server_pb2.GetKey(request.key, request.ClientId, request.RequestId))
+        leader_get = kv_stub.Get(server_pb2.GetKey(key=request.key, ClientId=request.ClientId, RequestId=request.RequestId))
         
         while not leader_get or leader_get.wrongLeader:
             leader_get = self.broadcast_for_leader(request, "Get")
@@ -55,7 +55,7 @@ class FrontEndHandler(server_pb2_grpc.FrontEndServicer):
     def Put(self, request, context):
         channel = grpc.insecure_channel(self.leader_port)
         kv_stub = server_pb2_grpc.KeyValueStoreStub(channel)
-        leader_put = kv_stub.Get(server_pb2.KeyValue(key=request.key, value=request.value, ClientId=request.ClientId, RequestId=request.RequestId))
+        leader_put = kv_stub.Put(server_pb2.KeyValue(key=request.key, value=request.value, ClientId=request.ClientId, RequestId=request.RequestId))
         
         while not leader_put or leader_put.wrongLeader:
             leader_put = self.broadcast_for_leader(request, "Put")
@@ -67,7 +67,7 @@ class FrontEndHandler(server_pb2_grpc.FrontEndServicer):
     def Replace(self, request, context):
         channel = grpc.insecure_channel(self.leader_port)
         kv_stub = server_pb2_grpc.KeyValueStoreStub(channel)
-        leader_replace = kv_stub.Get(server_pb2.KeyValue(key=request.key, value=request.value, ClientId=request.ClientId, RequestId=request.RequestId))
+        leader_replace = kv_stub.Replace(server_pb2.KeyValue(key=request.key, value=request.value, ClientId=request.ClientId, RequestId=request.RequestId))
         
         while not leader_replace or leader_replace.wrongLeader:
             leader_replace = self.broadcast_for_leader(request, "Replace")
@@ -85,9 +85,10 @@ class FrontEndHandler(server_pb2_grpc.FrontEndServicer):
 
         for node_id in range(1, num_nodes + 1):
             # Create a new process for each server
-            p = Process(target=server.start_server, args=(node_id, num_nodes))
+            p = Process(target=server.start_server, args=(node_id, num_nodes), name=f"raftserver{node_id}")
             p.start()
             processes.append(p)
+            self.peers[f"localhost:{9000 + node_id}"] = grpc.insecure_channel(f"localhost:{9000 + node_id}")
 
         print("All servers have been started as separate processes.")
 
