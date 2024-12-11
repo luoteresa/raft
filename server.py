@@ -5,6 +5,7 @@ import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from setproctitle import setproctitle
 
 ELECTION_TIMEOUT_MIN = 0.75
 ELECTION_TIMEOUT_MAX = 1.5
@@ -331,6 +332,9 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
         while self.get_acks_for_length(len(self.log)) < minimum_acks:
             time.sleep(0.01)
 
+        if self.verbose:
+            print("acks", self.get_acks_for_length(len(self.log)))
+
         self.commit_log_entries()
 
         if request.key in self.kv_store and self.kv_store[request.key] == request.value:
@@ -423,6 +427,7 @@ def start_server(node_id, num_nodes, base_port=9000, raft_base_port=7000):
     """Starts a single gRPC server for the given node_id."""
     port = base_port + node_id
     raft_port = raft_base_port + node_id
+    setproctitle(f"raftserver{node_id}")
 
     # Initialize the gRPC server
     raft_server = grpc.server(ThreadPoolExecutor(max_workers=10))
