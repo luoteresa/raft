@@ -46,9 +46,10 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
             self.acked_length[node_id] = 0
 
     def initialize_connections(self):
+        start_port = 7001 + (self.node_id - 1) * len(self.membership_ids)
         for member_id in self.membership_ids:
             if self.node_id != member_id:
-                channel = grpc.insecure_channel(f"localhost:{7000 + member_id}")
+                channel = grpc.insecure_channel(f"localhost:{start_port + (member_id - 1)}")
                 raft_stub = pb2_grpc.RaftStub(channel)
                 self.raft_peers[member_id] = raft_stub
     
@@ -423,10 +424,9 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
             self.start_election
         )
     
-def start_server(node_id, num_nodes, base_port=9000, raft_base_port=7000):
+def start_server(node_id, num_nodes):
     """Starts a single gRPC server for the given node_id."""
-    port = base_port + node_id
-    raft_port = raft_base_port + node_id
+    port = 9001 + (node_id - 1)
     setproctitle(f"raftserver{node_id}")
 
     # Initialize the gRPC server
@@ -444,14 +444,18 @@ def start_server(node_id, num_nodes, base_port=9000, raft_base_port=7000):
 
     # Bind to ports
     raft_server.add_insecure_port(f"localhost:{port}")
-    raft_server.add_insecure_port(f"localhost:{raft_port}")
+    
+    for member_id in range(1, num_nodes + 1):
+        other_start_port = 7001 + (member_id - 1) * num_nodes
+        if node_id != member_id:
+            raft_server.add_insecure_port(f"localhost:{other_start_port + (node_id - 1) }")
+            print(f"Connecting to port {other_start_port + (node_id - 1)}")
 
     # Start RAFT protocol for leader election
     handler.start_raft()
 
     # Start the gRPC server
     raft_server.start()
-    print(f"Node {node_id} started on ports {port} and {raft_port}")
 
     # Wait for termination
     raft_server.wait_for_termination()
