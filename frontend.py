@@ -87,3 +87,12 @@ class FrontEndHandler(server_pb2_grpc.FrontEndServicer):
             self.peers[f"localhost:{9000 + node_id}"] = grpc.insecure_channel(f"localhost:{9000 + node_id}")
 
         return server_pb2.Reply(wrongLeader=False, error="", value="")
+
+if __name__ == '__main__':
+    frontend_server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    server_pb2_grpc.add_FrontEndServicer_to_server(FrontEndHandler(), frontend_server)
+    frontend_server.add_insecure_port("localhost:8001")
+    frontend_server.start()
+    
+    while True:
+        frontend_server.wait_for_termination()

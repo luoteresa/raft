@@ -7,9 +7,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from setproctitle import setproctitle
 
-ELECTION_TIMEOUT_MIN = 0.75
-ELECTION_TIMEOUT_MAX = 1.5
-HEARTBEAT_INTERVAL = 0.2 # 5 heartbeats per second
+ELECTION_TIMEOUT_MIN = 1
+ELECTION_TIMEOUT_MAX = 2
+HEARTBEAT_INTERVAL = 0.3
 
 class LogEntry:
     def __init__(self, key, value, term):
@@ -35,6 +35,7 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
         self.kv_store = {} # Key value store
         self.election_timer = None
         self.heartbeat_timer = None
+        # self.ack_condition = threading.Condition()  # Condition variable for acks needed to commit
         self.initialize_sent_acked_length()
         self.initialize_connections()
         
@@ -66,7 +67,7 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
             return
         
         if self.verbose:
-            print(f"STARTING ELECTION ON {self.port} {self.node_id}")
+            print(f"STARTING ELECTION ON NODE {self.node_id}")
         
         self.current_term += 1
         self.current_role = 'Candidate'
@@ -83,12 +84,10 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
             )
             try:
                 response = self.raft_peers[node_id].RequestVote(request)
-                if self.verbose:
-                    print(f"NODE {self.node_id} RECEIVED VOTE FROM NODE ", node_id)
-                    print(f"NODE {self.node_id} HAS VOTES FROM {self.votes_received}")
                 self.on_vote_response(node_id, response.term, response.voteGranted)
             except grpc.RpcError as e:
-                print(f"Error contacting node {node_id}: {e}")
+                # print(f"Error contacting node {node_id}: {e}")
+                pass
 
         with ThreadPoolExecutor() as executor:
             for node_id in self.membership_ids:
@@ -119,14 +118,26 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
         
     # Invoked by: Candidate
     def on_vote_response(self, voter_id, term, granted):
-        if self.current_term == term and granted:
+        if term > self.current_term:
+            self.current_term = term
+            self.current_role = 'Follower'
+            self.voted_for = None
+            if self.election_timer:
+                self.election_timer.cancel()
+                self.election_timer = None
+        elif self.current_role != 'Leader' and self.current_term == term and granted:
             self.votes_received.add(voter_id)
+            if self.verbose:
+                print(f"NODE {self.node_id} RECEIVED VOTE FROM NODE ", voter_id)
+                print(f"NODE {self.node_id} HAS VOTES FROM {self.votes_received}")
             if len(self.votes_received) >= len(self.membership_ids) // 2 + 1:
                 print(f"Node {self.node_id} got the majority and is now leader")
                 self.current_role = 'Leader'
                 self.current_leader = self.node_id
+                
                 if self.election_timer:
                     self.election_timer.cancel()
+                    self.election_timer = None
                     
                 # Start sending heartbeats
                 self.leader_heartbeat()  
@@ -139,16 +150,7 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
                 with ThreadPoolExecutor() as executor:
                     for follower_id in self.membership_ids:
                         if follower_id != self.node_id:
-                            executor.submit(replicate_to_follower, follower_id)
-        elif term > self.current_term:
-            self.current_term = term
-            self.current_role = 'Follower'
-            self.voted_for = None
-            self.election_timer = self.reset_timer(
-                    self.election_timer, 
-                    random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), 
-                    self.start_election
-                )
+                            executor.submit(replicate_to_follower, follower_id) 
 
     # Invoked by: Follower
     def append_entries(self, prefix_length, leader_commit, entries):
@@ -206,7 +208,8 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
             response = self.raft_peers[follower_id].AppendEntries(request)
             self.on_log_response(follower_id, response.term, response.newAckedLength, response.success)
         except grpc.RpcError as e:
-            print(f"Error replicating log to node {follower_id}: {e}")
+            # print(f"Error replicating log to node {follower_id}: {e}")
+            pass
     
     # Invoked by: Follower
     # Equivalent to AppendEntries RPC in paper, is a wrapper that also checks for term
@@ -214,19 +217,22 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
         if term > self.current_term:
             self.current_term = term
             self.voted_for = None
+            
+            if self.election_timer:
+                self.election_timer.cancel()
+                self.election_timer = None
+            
         if term == self.current_term:
             self.current_role = 'Follower' 
             self.current_leader = leader_id
-        
+            
         # Received heartbeat from leader, reset election timer
         self.election_timer = self.reset_timer(
-            self.election_timer, 
-            random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), 
-            self.start_election
+            self.election_timer, random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), self.start_election
         )
 
         log_ok = (len(self.log) >= prefix_length) and \
-            (prefix_length == 0 or self.log[-1].term == prefix_term)
+            (prefix_length == 0 or self.log[prefix_length - 1].term == prefix_term)
         if log_ok:
             self.append_entries(prefix_length, leader_commit, entries)
             new_acked_length = prefix_length + len(entries)
@@ -240,6 +246,9 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
             if success and new_acked_length >= self.acked_length[follower_id]:
                 self.sent_length[follower_id] = new_acked_length
                 self.acked_length[follower_id] = new_acked_length
+                # Notify that we have another ack
+                # with self.ack_condition:
+                #     self.ack_condition.notify_all()
                 self.commit_log_entries()
             elif self.sent_length[follower_id] > 0:
                 self.sent_length[follower_id] -= 1
@@ -252,13 +261,20 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
                 if self.heartbeat_timer:
                     self.heartbeat_timer.cancel()
                     self.heartbeat_timer = None
-                
-                self.election_timer = self.reset_timer(
-                    self.election_timer, 
-                    random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), 
-                    self.start_election
-                )
                     
+                if self.election_timer:
+                    self.election_timer.cancel()
+                    self.election_timer = None
+                    
+                # self.election_timer = self.reset_timer(
+                #     self.election_timer, random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), self.start_election
+                # )
+                
+                # self.election_timer = self.reset_timer(
+                #     self.election_timer, 
+                #     random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), 
+                #     self.start_election
+                # )
                 
     # Invoked by: All            
     def crash_recovery(self):
@@ -326,7 +342,14 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
         with ThreadPoolExecutor() as executor:
             for follower_id in self.membership_ids:
                 if follower_id != self.node_id:
-                    executor.submit(self.replicate_log, self.node_id, follower_id)    
+                    executor.submit(self.replicate_log, self.node_id, follower_id)  
+                    
+        # Wait for majority acknowledgment using a condition, not busy waiting
+        # minimum_acks = len(self.membership_ids) // 2 + 1
+
+        # with self.ack_condition:
+        #     while self.get_acks_for_length(len(self.log)) < minimum_acks:
+        #         self.ack_condition.wait()  
 
         # Wait for majority acknowledgment
         minimum_acks = len(self.membership_ids) // 2 + 1
@@ -419,9 +442,7 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
             
     def start_raft(self):
         self.election_timer = self.reset_timer(
-            None,
-            random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX),
-            self.start_election
+            self.election_timer, random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX), self.start_election
         )
     
 def start_server(node_id, num_nodes):
@@ -430,7 +451,7 @@ def start_server(node_id, num_nodes):
     setproctitle(f"raftserver{node_id}")
 
     # Initialize the gRPC server
-    raft_server = grpc.server(ThreadPoolExecutor(max_workers=10))
+    raft_server = grpc.server(ThreadPoolExecutor(max_workers=20))
     handler = ServerHandler(
         node_id, 
         list(range(1, num_nodes + 1)), 
