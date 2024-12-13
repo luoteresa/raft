@@ -451,7 +451,7 @@ def start_server(node_id, num_nodes):
     setproctitle(f"raftserver{node_id}")
 
     # Initialize the gRPC server
-    raft_server = grpc.server(ThreadPoolExecutor(max_workers=20))
+    raft_server = grpc.server(ThreadPoolExecutor(max_workers=5))
     handler = ServerHandler(
         node_id, 
         list(range(1, num_nodes + 1)), 
