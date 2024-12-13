@@ -1,4 +1,4 @@
-import grpc # type: ignore
+import grpc
 import server_pb2_grpc
 import server_pb2
 import frontend

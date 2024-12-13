@@ -31,7 +31,6 @@ class FrontEndHandler(server_pb2_grpc.FrontEndServicer):
 
     def forward_request(self, rpc_func, request):
         if self.current_leader_stub is None:
-            # Attempt to find a leader if we don't have one
             self.find_leader()
             if self.current_leader_stub is None:
                 return server_pb2.Reply(wrongLeader=True, error="No leader found", value="")
