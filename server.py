@@ -6,6 +6,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from setproctitle import setproctitle
+from persist_state import PersistentStateStore
 
 ELECTION_TIMEOUT_MIN = 1
 ELECTION_TIMEOUT_MAX = 2
@@ -33,6 +34,7 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
         self.acked_length = {} # Maps follower IDs to length of logs acked
         self.raft_peers = {} # Map membership IDs to gRPC connections
         self.kv_store = {} # Key value store
+        self.persist_store = PersistentStateStore(f"log_node{self.node_id}.pkl", f"index_node{self.node_id}.log")
         self.election_timer = None
         self.heartbeat_timer = None
         # self.ack_condition = threading.Condition()  # Condition variable for acks needed to commit
@@ -167,6 +169,7 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
                 # TODO: Deliver log[i].msg to the application -- Done in RPC implementation?
                 log_entry = self.log[i]
                 self.kv_store[log_entry.key] = log_entry.value
+                self.persist_store.save_state(log_entry)
             self.commit_length = leader_commit
     
     def get_acks_for_length(self, length):
@@ -283,6 +286,11 @@ class ServerHandler(pb2_grpc.RaftServicer, pb2_grpc.KeyValueStoreServicer):
         self.votes_received = set()
         self.sent_length = {}
         self.acked_length = {}
+        self.log = self.persist_store.load_all_states()
+        for entry in self.log:
+            self.kv_store[entry.key] = self.kv_store[entry.value]
+        self.commit_length = len(self.log)
+        self.current_term = self.log[-1].term
     
     # Invoked by: Leader
     def leader_heartbeat(self):
